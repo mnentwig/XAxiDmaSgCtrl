@@ -14,7 +14,8 @@ int main(void){
 	xil_printf("SG DMA test\r\n");
 	dmaFeed::installGlobalIrqExceptionHandler();
 	dmaFeedConfig c(XPAR_AXIDMA_0_DEVICE_ID, txIntrId, rxIntrId);
-	dmaFeed d(c);
+	//c.maxPacketSize = 4;
+	dmaFeedSimple d(c);
 
 	int n = 10000000;
 	u32* txBuf = (u32*)malloc(n*sizeof(u32)); assert(txBuf);

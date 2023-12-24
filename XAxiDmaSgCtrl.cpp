@@ -92,6 +92,16 @@ void dmaFeed::installGlobalIrqExceptionHandler(){
 	Xil_ExceptionEnable();
 }
 
+void dmaFeed::done(){
+	assert(!doneFlag);
+
+	XAxiDma_Bd *firstBdPtr;
+	assert(!XAxiDma_BdRingFromHw(txRingPtr, /*no limit to the number of returned BDs*/XAXIDMA_ALL_BDS, &firstBdPtr) && "done() called with uncollected Tx RBs in DMA hardware"); // BdRingFromHw is free of side effects as long as it returns 0
+	assert(!XAxiDma_BdRingFromHw(rxRingPtr, /*no limit to the number of returned BDs*/XAXIDMA_ALL_BDS, &firstBdPtr) && "done() called with uncollected Rx RBs in DMA hardware"); // BdRingFromHw is free of side effects as long as it returns 0
+
+	doneFlag = true;
+}
+
 void dmaFeed::interruptsOnOff(bool newState){
 	interruptsDmaOnOff(newState);
 	interruptsIrcOnOff(newState);
@@ -165,33 +175,18 @@ void dmaFeed::interruptsIrcOnOff(bool newState){
 }
 #endif
 
-void dmaFeed::runStart(char* txBuf, u32 numTxBytes, char* rxBuf, u32 numRxBytes){
-
-	acquireBDRings();
-
-	assert(((uintptr_t)txBuf & 3) == 0); // check alignment
-	assert(((uintptr_t)rxBuf & 3) == 0); // check alignment
-	txPtr = txBuf;
-	rxPtr = rxBuf;
-	nTxBytesRemainingToQueue = numTxBytes;
-	nRxBytesRemainingToQueue = numRxBytes;
-	nTxBytesRemainingToComplete = numTxBytes;
-	nRxBytesRemainingToComplete = numRxBytes;
-	txDone = false;
-	rxDone = false;
+void dmaFeed::runStart(){
+	doneFlag = false;
 	dmaError = false;
 
-	// DMA doesn't go through cache => must flush
-	Xil_DCacheFlushRange((INTPTR)txBuf, numTxBytes);
-	Xil_DCacheFlushRange((INTPTR)rxBuf, numRxBytes);
+	acquireBDRings();
 
 	// === enable callback ===
 	// note: edge sensitive => must enable before starting
 	interruptsOnOff(true);
 
 	// === queue first BDs ===
-	queueTx(/*nNewBytesTransmitted*/0);
-	queueRx(/*nNewBytesReceived*/0);
+	queue(/*txEvent*/true, /*rxEvent*/true); // both Tx and Rx RBs are available
 
 	// === start transfer ===
 	int s; // generic state
@@ -223,24 +218,160 @@ dmaFeed::run_poll_e dmaFeed::run_poll(){
 		// run_poll() reports an error only once
 		dmaError = false;
 		return DMAFEED_IDLE_ERROR;
-	}
-	if (txDone && rxDone)
-		return DMAFEED_IDLE;
-	return DMAFEED_BUSY;
+	} // if dmaError
+
+	return doneFlag ? DMAFEED_IDLE : DMAFEED_BUSY;
 }
 
-void dmaFeed::queueTx(unsigned int numNewBytesTransmitted){
-	assert(!txDone); // txInterruptCallback would suppress
- 	// === A): Transmit data in free buffers ===
+dmaFeed::~dmaFeed(){
+	// disable interrupts
+	interruptsOnOff(false);
+	free(bufferDescriptorSpace); // from aligned_alloc; free(NULL) is safe
+}
 
+void dmaFeed::txInterruptCallback(dmaFeed* self){
+	// === get and acknowledge IRQ status ===
+	u32 irqStatus = XAxiDma_BdRingGetIrq(self->txRingPtr);
+	XAxiDma_BdRingAckIrq(self->txRingPtr, irqStatus);
+
+	if (!(irqStatus & XAXIDMA_IRQ_ALL_MASK))
+		return; // nothing to do (shortcut)
+
+	if (self->doneFlag)
+		return; // possible delay interrupt after user code has flagged completion, suppress callbacks
+
+	if ((irqStatus & XAXIDMA_IRQ_ERROR_MASK))
+		self->dmaError = true;
+
+	if (self->dmaError)
+		return; // no user code callbacks in error state, pending reset
+
+	if (!(irqStatus & (XAXIDMA_IRQ_DELAY_MASK | XAXIDMA_IRQ_IOC_MASK)))
+		return;
+
+	self->collectTx(); // continue with implementation-specific code to free (and optionally, process) Tx BDs completed by the DMA hardware
+	self->queue(/*txEvent*/true, /*rxEvent*/false);
+}
+
+void dmaFeed::rxInterruptCallback(dmaFeed* self){
+	// === get and acknowledge IRQ status ===
+	u32 irqStatus = XAxiDma_BdRingGetIrq(self->rxRingPtr);
+	XAxiDma_BdRingAckIrq(self->rxRingPtr, irqStatus);
+
+	if (!(irqStatus & XAXIDMA_IRQ_ALL_MASK))
+		return; // nothing to do (shortcut)
+
+	if (self->doneFlag)
+		return; // possible delay interrupt after user code has flagged completion, suppress callbacks
+
+	if ((irqStatus & XAXIDMA_IRQ_ERROR_MASK))
+		self->dmaError = true;
+
+	if (self->dmaError)
+		return; // no callbacks in error state, pending reset
+
+	if (!(irqStatus & (XAXIDMA_IRQ_DELAY_MASK | XAXIDMA_IRQ_IOC_MASK)))
+		return;
+
+	self->collectRx(); // continue with implementation-specific code to free (and optionally, process) Rx BDs completed by the DMA hardware
+	self->queue(/*txEvent*/false, /*rxEvent*/true);
+}
+
+
+// ============================================================================================================================
+// dmaFeedSimple
+// ============================================================================================================================
+dmaFeedSimple::dmaFeedSimple(const dmaFeedConfig& config) : dmaFeed(config){}
+
+unsigned int dmaFeedSimple::bytesToBufs(unsigned int nBytes, unsigned int nBufAvailable) const {
+	u32 nBuf = nBytes / config.maxPacketSize;
+	u32 nBytesRem = nBytes - nBuf * config.maxPacketSize;
+	if (nBytesRem > 0)
+		++nBuf;
+	return (nBuf > nBufAvailable) ? nBufAvailable : nBuf;
+}
+
+void dmaFeedSimple::collectTx()/*override*/{
+	// === get completed BDs ===
+	// note: this will be empty on startup
+	XAxiDma_Bd *firstBdPtr; // first buffer descriptor in returned set
+	int nBd = XAxiDma_BdRingFromHw(txRingPtr, /*no limit to the number of returned BDs*/XAXIDMA_ALL_BDS, &firstBdPtr);
+	XAxiDma_Bd *itBdPtr = firstBdPtr;
+	//xil_printf("tx int callback status: %08x with %i BDs\r\n", irqStatus, nBd);
+
+	// === count transmitted bytes ===
+	unsigned int numNewBytesTransmitted = 0;
+	int bdCount = nBd;
+	while (bdCount--){
+		u32 bdStatus = XAxiDma_BdGetSts(itBdPtr);
+		assert(!(bdStatus & XAXIDMA_BD_STS_ALL_ERR_MASK));
+	    assert(bdStatus & XAXIDMA_BD_STS_COMPLETE_MASK);
+	    numNewBytesTransmitted += XAxiDma_BdGetLength(itBdPtr, txRingPtr->MaxTransferLen);
+		itBdPtr = (XAxiDma_Bd *)XAxiDma_BdRingNext(txRingPtr, itBdPtr);
+	}
+
+	// === return completed BDs to pool ===
+	int s = XAxiDma_BdRingFree(txRingPtr, nBd, firstBdPtr); assert(s == XST_SUCCESS && "XAxiDma_BdRingFree(Tx) failed");
+
+	// === detect end of (fixed length) transmission ===
+	assert(numNewBytesTransmitted <= nTxBytesRemainingToComplete);
+	nTxBytesRemainingToComplete -= numNewBytesTransmitted;
+
+	if (!nTxBytesRemainingToComplete){
+		txDone = true;
+		if (txDone && rxDone)
+			done();
+	}
+}
+
+void dmaFeedSimple::collectRx()/*override*/{
+	// === get completed BDs ===
+	// note: this will be empty on startup
+	XAxiDma_Bd *firstBdPtr; // first buffer descriptor in returned set
+	int nBd = XAxiDma_BdRingFromHw(rxRingPtr, /*no limit to the number of returned BDs*/XAXIDMA_ALL_BDS, &firstBdPtr);
+	XAxiDma_Bd *itBdPtr = firstBdPtr;
+
+	// === count received bytes ===
+	unsigned int numNewBytesReceived = 0;
+	int bdCount = nBd;
+	while (bdCount--){
+		u32 bdStatus = XAxiDma_BdGetSts(itBdPtr);
+		assert(!(bdStatus & XAXIDMA_BD_STS_ALL_ERR_MASK));
+	    assert(bdStatus & XAXIDMA_BD_STS_COMPLETE_MASK);
+	    numNewBytesReceived += XAxiDma_BdGetLength(itBdPtr, rxRingPtr->MaxTransferLen);
+		itBdPtr = (XAxiDma_Bd *)XAxiDma_BdRingNext(rxRingPtr, itBdPtr);
+	}
+
+	// === return completed BDs to pool ===
+	int s = XAxiDma_BdRingFree(rxRingPtr, nBd, firstBdPtr); assert(s == XST_SUCCESS && "XAxiDma_BdRingFree(Rx) failed");
+
+	// === detect end of reception ===
+	assert(numNewBytesReceived <= nRxBytesRemainingToComplete);
+	nRxBytesRemainingToComplete -= numNewBytesReceived;
+
+	if (!nRxBytesRemainingToComplete){
+		rxDone = true;
+		if (txDone && rxDone)
+			done();
+	}
+}
+
+void dmaFeedSimple::queue(bool txEvent, bool rxEvent)/*override*/{
+	if (txEvent)
+		queueTx();
+	if (rxEvent)
+		queueRx();
+}
+
+void dmaFeedSimple::queueTx(){
 	// number of available (idle) buffers
 	int nFreeBd = XAxiDma_BdRingGetFreeCnt(txRingPtr); assert(nFreeBd && "queueTx() should never encounter zero idle buffers");
 	// number of buffers to queue
 	unsigned int nBufsToQueue = bytesToBufs(nTxBytesRemainingToQueue, /*limit to*/nFreeBd);
 	//xil_printf("queueTx got %i free Bds need %i\r\n", nFreeBd, nBufsToQueue);
 
+	int s;
 	if (nBufsToQueue > 0){
-		int s; // generic status return value
 		XAxiDma_Bd *firstBdPtr; // first buffer descriptor in allocated set
 		s = XAxiDma_BdRingAlloc(txRingPtr, nBufsToQueue, &firstBdPtr); assert (s == XST_SUCCESS && "DMA queueTx: BdRingAlloc() failed");
 		XAxiDma_Bd* itBdPtr = firstBdPtr; // buffer descriptor iterating over allocated set
@@ -280,25 +411,16 @@ void dmaFeed::queueTx(unsigned int numNewBytesTransmitted){
 		// === submit to hardware ===
 		s = XAxiDma_BdRingToHw(txRingPtr, nBufsToQueue, firstBdPtr); assert (s == XST_SUCCESS && "DMA queueTx: BdRingToHw() failed");
 	} // if bufs to queue
-
-	// === B) detect end of transmission ===
-	assert(numNewBytesTransmitted <= nTxBytesRemainingToComplete);
-	nTxBytesRemainingToComplete -= numNewBytesTransmitted;
-
-	if (!nTxBytesRemainingToComplete)
-		txDone = true;
 }
 
-void dmaFeed::queueRx(unsigned int numNewBytesReceived){
-	assert(!rxDone && "dmaFeed: unexpected Rx callback");
-
-	int s;
+void dmaFeedSimple::queueRx(){
 	int nFreeBd = XAxiDma_BdRingGetFreeCnt(rxRingPtr); assert(nFreeBd && "queueRx() should never encounter zero idle buffers");
 
 	// number of buffers to queue
 	unsigned int nBufsToQueue = bytesToBufs(nRxBytesRemainingToQueue, /*limit to*/nFreeBd);
 	//xil_printf("queueRx got %i free Bds need %i\r\n", nFreeBd, nBufsToQueue);
 
+	int s;
 	if (nBufsToQueue > 0){
 		XAxiDma_Bd* firstBdPtr;
 		s = XAxiDma_BdRingAlloc(rxRingPtr, nBufsToQueue, &firstBdPtr); assert (s == XST_SUCCESS && "DMA queueRx: BdRingAlloc() failed");
@@ -320,98 +442,20 @@ void dmaFeed::queueRx(unsigned int numNewBytesReceived){
 
 		s = XAxiDma_BdRingToHw(rxRingPtr, nBufsToQueue, firstBdPtr); assert (s == XST_SUCCESS && "DMA queueRx: BdRingToHw() failed");
 	} // if bufs to queue
-
-	// === B) detect end of reception ===
-	assert(numNewBytesReceived <= nRxBytesRemainingToComplete);
-	nRxBytesRemainingToComplete -= numNewBytesReceived;
-
-	if (!nRxBytesRemainingToComplete)
-		rxDone = true;
 }
 
-unsigned int dmaFeed::bytesToBufs(unsigned int nBytes, unsigned int nBufAvailable) const {
-	u32 nBuf = nBytes / config.maxPacketSize;
-	u32 nBytesRem = nBytes - nBuf * config.maxPacketSize;
-	if (nBytesRem > 0)
-		++nBuf;
-	return (nBuf > nBufAvailable) ? nBufAvailable : nBuf;
-}
+void dmaFeedSimple::runStart(char* txBuf, u32 numTxBytes, char* rxBuf, u32 numRxBytes){
+	assert(((uintptr_t)txBuf & 3) == 0); // check alignment
+	assert(((uintptr_t)rxBuf & 3) == 0); // check alignment
+	txPtr = txBuf;
+	rxPtr = rxBuf;
+	nTxBytesRemainingToQueue = numTxBytes;
+	nRxBytesRemainingToQueue = numRxBytes;
+	nTxBytesRemainingToComplete = numTxBytes;
+	nRxBytesRemainingToComplete = numRxBytes;
 
-dmaFeed::~dmaFeed(){
-	// disable interrupts
-	interruptsOnOff(false);
-	free(bufferDescriptorSpace); // from aligned_alloc; free(NULL) is safe
-}
-
-void dmaFeed::txInterruptCallback(dmaFeed* self){
-	// === get and acknowledge IRQ status ===
-	u32 irqStatus = XAxiDma_BdRingGetIrq(self->txRingPtr);
-	XAxiDma_BdRingAckIrq(self->txRingPtr, irqStatus);
-
-	if (!(irqStatus & XAXIDMA_IRQ_ALL_MASK))
-		return; // nothing to do (shortcut)
-
-	if ((irqStatus & XAXIDMA_IRQ_ERROR_MASK))
-		self->dmaError = true;
-
-	if (self->dmaError)
-		return; // no callbacks in error state
-
-	if (!(irqStatus & (XAXIDMA_IRQ_DELAY_MASK | XAXIDMA_IRQ_IOC_MASK)))
-		return;
-	XAxiDma_Bd *firstBdPtr; // first buffer descriptor in returned set
-	int nBd = XAxiDma_BdRingFromHw(self->txRingPtr, /*no limit to the number of returned BDs*/XAXIDMA_ALL_BDS, &firstBdPtr);
-	XAxiDma_Bd *itBdPtr = firstBdPtr;
-	//xil_printf("tx int callback status: %08x with %i BDs\r\n", irqStatus, nBd);
-
-	unsigned int numNewBytesTransmitted = 0;
-	int bdCount = nBd;
-	while (bdCount--){
-		u32 bdStatus = XAxiDma_BdGetSts(itBdPtr);
-		assert(!(bdStatus & XAXIDMA_BD_STS_ALL_ERR_MASK));
-	    assert(bdStatus & XAXIDMA_BD_STS_COMPLETE_MASK);
-	    numNewBytesTransmitted += XAxiDma_BdGetLength(itBdPtr, self->txRingPtr->MaxTransferLen);
-		itBdPtr = (XAxiDma_Bd *)XAxiDma_BdRingNext(self->txRingPtr, itBdPtr);
-	}
-
-	int s = XAxiDma_BdRingFree(self->txRingPtr, nBd, firstBdPtr); assert(s == XST_SUCCESS && "XAxiDma_BdRingFree(Tx) failed");
-
-	if (!self->txDone) // e.g. if interrupt coalescing is enabled, there may be a final delay interrupt with nBd==0
-		self->queueTx(numNewBytesTransmitted);
-}
-
-void dmaFeed::rxInterruptCallback(dmaFeed* self){
-	// === get and acknowledge IRQ status ===
-	u32 irqStatus = XAxiDma_BdRingGetIrq(self->rxRingPtr);
-	XAxiDma_BdRingAckIrq(self->rxRingPtr, irqStatus);
-
-	if (!(irqStatus & XAXIDMA_IRQ_ALL_MASK))
-		return; // nothing to do (shortcut)
-
-	if ((irqStatus & XAXIDMA_IRQ_ERROR_MASK))
-		self->dmaError = true;
-
-	if (self->dmaError)
-		return; // no callbacks in error state
-
-	if (!(irqStatus & (XAXIDMA_IRQ_DELAY_MASK | XAXIDMA_IRQ_IOC_MASK)))
-		return;
-
-	XAxiDma_Bd *firstBdPtr; // first buffer descriptor in returned set
-	int nBd = XAxiDma_BdRingFromHw(self->rxRingPtr, /*no limit to the number of returned BDs*/XAXIDMA_ALL_BDS, &firstBdPtr);
-	XAxiDma_Bd *itBdPtr = firstBdPtr;
-
-	unsigned int numNewBytesReceived = 0;
-	int bdCount = nBd;
-	while (bdCount--){
-		u32 bdStatus = XAxiDma_BdGetSts(itBdPtr);
-		assert(!(bdStatus & XAXIDMA_BD_STS_ALL_ERR_MASK));
-	    assert(bdStatus & XAXIDMA_BD_STS_COMPLETE_MASK);
-	    numNewBytesReceived += XAxiDma_BdGetLength(itBdPtr, self->rxRingPtr->MaxTransferLen);
-		itBdPtr = (XAxiDma_Bd *)XAxiDma_BdRingNext(self->rxRingPtr, itBdPtr);
-	}
-
-	int s = XAxiDma_BdRingFree(self->rxRingPtr, nBd, firstBdPtr); assert(s == XST_SUCCESS && "XAxiDma_BdRingFree(Rx) failed");
-
-	self->queueRx(numNewBytesReceived);
+	// DMA doesn't go through cache => must flush
+	Xil_DCacheFlushRange((INTPTR)txBuf, numTxBytes);
+	Xil_DCacheFlushRange((INTPTR)rxBuf, numRxBytes);
+	dmaFeed::runStart();
 }
