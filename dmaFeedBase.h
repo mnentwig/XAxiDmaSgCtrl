@@ -1,5 +1,5 @@
-#ifndef XAXIDMASGCTRL_H
-#define XAXIDMASGCTRL_H
+#ifndef DMAFEEDBASE_H
+#define DMAFEEDBASE_H
 #include "xaxidma.h"
 
 #include "xparameters.h"
@@ -20,14 +20,13 @@
 #endif
 
 // all fields may be optionally configured before passing to dmaFeed constructor
-class dmaFeedConfig{
+class dmaFeedBaseConfig{
 public:
-	dmaFeedConfig(unsigned int dmaDevId, unsigned int txIntrId, unsigned int rxIntrId) :
+	dmaFeedBaseConfig(unsigned int dmaDevId, unsigned int txIntrId, unsigned int rxIntrId) :
 		dmaDevId(dmaDevId), txIntrId(txIntrId), rxIntrId(rxIntrId){}
 	u32 dmaDevId;
 	unsigned int txIntrId; // Tx side interrupt ID
 	unsigned int rxIntrId; // Rx side interrupt ID
-	u32 maxPacketSize = 1 << 13; // up to configured width of DMA length register e.g. XPAR_AXI_DMA_0_SG_LENGTH_WIDTH
 	// number of Tx interrupts required for callback
 	unsigned int coalesceNTxInterrupts = XAXIDMA_NO_CHANGE;
 	// number of Tx interrupts required for callback
@@ -39,10 +38,10 @@ public:
 };
 
 // dmaFeed sends and receives a predetermined amount of data on a given DMA channel
-class dmaFeed{
+class dmaFeedBase{
 public:
-	dmaFeed(const dmaFeedConfig& config);
-	~dmaFeed();
+	dmaFeedBase(const dmaFeedBaseConfig& config);
+	~dmaFeedBase();
 	typedef enum {
 		// freshly initialized or transaction has completed
 		DMAFEED_IDLE=0,
@@ -86,7 +85,7 @@ protected: // custom derived class would override collectTx(), collectRx(), queu
 	void done();
 
 	// parameters that can be externally configured
-	dmaFeedConfig config;
+	dmaFeedBaseConfig config;
 
 	// DMA Tx buffer descriptor ring from XAxiDma_GetTxRing();
 	XAxiDma_BdRing *txRingPtr = NULL;
@@ -116,10 +115,10 @@ private:
 	XAxiDma iDma; // DMA hardware block "instance"
 
 	// triggered by DMA Tx interrupt after coalescing
-	static void txInterruptCallback(dmaFeed* self);
+	static void txInterruptCallback(dmaFeedBase* self);
 
 	// triggered by DMA Rx interrupt after coalescing
-	static void rxInterruptCallback(dmaFeed* self);
+	static void rxInterruptCallback(dmaFeedBase* self);
 
 	volatile bool dmaError = false;
 	// all memory allocated for buffer descriptors
@@ -137,45 +136,5 @@ private:
 #ifdef DMAFEED_HAS_SCUGIC
 	static XScuGic iIntc; // interrupt controller "instance"
 #endif
-};
-
-// sends and receives a predetermined amount of data from and to memory
-class dmaFeedSimple: public dmaFeed{
-public:
-	dmaFeedSimple(const dmaFeedConfig& config);
-	void runStart(char* txBuf, u32 numTxBytes, char* rxBuf, u32 numRxBytes);
-private:
-	void collectTx() override final;
-	void collectRx() override final;
-	void queue(bool txFlag, bool rxFlag) override final;
-	void queueTx(); // splitting queue() in two for readability
-	void queueRx(); // splitting queue() in two for readability
-
-	// remaining number of outbound bytes to queue
-	u32 nTxBytesRemainingToQueue = 0;
-
-	// remaining number of inbound bytes to queue
-	u32 nRxBytesRemainingToQueue = 0;
-
-	// remaining number of outbound bytes pending completion
-	u32 nTxBytesRemainingToComplete = 0;
-
-	// remaining number of inbound bytes pending completion
-	u32 nRxBytesRemainingToComplete = 0;
-
-	// running pointer into outbound data
-	char* txPtr = NULL;
-
-	// running pointer into inbound data
-	char* rxPtr = NULL;
-
-	// txHandler sets this flag when all Tx data has been queued
-	volatile bool txDone = false;
-
-	// rxHandler sets this flag when all Rx data has been received
-	volatile bool rxDone = false;
-
-	// need retval buffers to transmit given nr. bytes (not exceeding nBufAvailable)
-	unsigned int bytesToBufs(unsigned int nBytes, unsigned int nBufAvailable) const;
 };
 #endif
